@@ -1,0 +1,129 @@
+defaults:
+  - ../config/envs@_here_
+  - ../config/deepspeed_zero@_here_
+  - ../config/deepspeed_zero2@_here_
+  - ../config/deepspeed_zero3@_here_
+  - ../config/deepspeed_zero3_cpuoffload@_here_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+exp_name: "agentic_pipeline_api"
+output_dir: ./output
+seed: 42
+system_envs:
+  USE_MODELSCOPE: '1'
+
+track_with: tensorboard
+tracker_kwargs:
+  log_dir: ./runs/tensorboard
+
+# CPU-only run
+num_gpus_per_node: 0
+
+max_steps: 1
+save_steps: 10000
+logging_steps: 1
+eval_steps: 10
+resume_from_checkpoint: false
+
+rollout_batch_size: 8
+val_batch_size: 8
+sequence_length: 4096
+
+# memRL settings
+freeze_model: true
+adv_estimator: "reinforce"
+memory_enabled: false
+memory_db_path: ${output_dir}/memory/social_memory.sqlite3
+memory_top_k1: 8
+memory_top_k2: 4
+memory_alpha: 0.1
+memory_embedding_dim: 256
+memory_intent_turns: 5
+
+reward_clip: 20
+advantage_clip: 10.0
+ppo_epochs: 1
+init_kl_coef: 0.0
+whiten_advantages: true
+entropy_loss_coef: 0
+
+# Used for tokenizer only (override to your local tokenizer path if needed)
+pretrain: Qwen/Qwen3-4B
+
+actor_infer:
+  model_args:
+    flash_attn: fa2
+    disable_gradient_checkpointing: true
+    dtype: bf16
+  generating_args:
+    max_new_tokens: 1024
+    top_p: 0.99
+    top_k: 100
+    num_beams: 1
+    temperature: 0.6
+    num_return_sequences: 1
+  data_args:
+    template: qwen3
+  strategy_args:
+    strategy_name: api_infer
+    strategy_config:
+      base_url: "https://az.gptplus5.com/v1"
+      model: "gpt-4o-mini"
+      api_key_env: "OPENAI_API_KEY"
+      strip_special_tokens: true
+      timeout: 60
+      max_retries: 2
+      tokenizer_path: ${pretrain}
+  device_mapping: []
+
+enable_response_mask: true
+action_sep: "||"
+use_turn_scores: false
+enable_think: true
+max_actions_per_traj: 50
+
+custom_envs:
+  TicTacToe:
+    env_type: tictactoe
+    max_actions_per_traj:  ${max_actions_per_traj}
+    grid_vocab: false
+    env_config:
+      built_in_opponent: none
+      render_mode: text
+
+  TicTacToe-first-100:
+    env_type: tictactoe
+    max_actions_per_traj:  ${max_actions_per_traj}
+    grid_vocab: false
+    env_config:
+      built_in_opponent: mcts
+      render_mode: text
+
+  TicTacToe-second-100:
+    env_type: tictactoe
+    max_actions_per_traj:  ${max_actions_per_traj}
+    grid_vocab: false
+    env_config:
+      built_in_opponent: mcts
+      opponent_player: 0
+      render_mode: text
+
+train_env_manager:
+  format_penalty: 0.05
+  max_env_num_per_worker: 4
+  env_groups: 8
+  group_size: 1
+  tags: [TicTacToe, TicTacToe-first-100, TicTacToe-second-100]
+  n_groups: [3, 3, 2]
+
+val_env_manager:
+  format_penalty: 0.05
+  max_env_num_per_worker: 4
+  env_groups: 8
+  group_size: 1
+  tags: [TicTacToe, TicTacToe-first-100, TicTacToe-second-100]
+  n_groups: [3, 3, 2]

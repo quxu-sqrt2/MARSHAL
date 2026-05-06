@@ -1,0 +1,1079 @@
+import copy
+import os
+import re
+import time
+import traceback
+from contextlib import nullcontext
+from dataclasses import dataclass, field, asdict
+from itertools import zip_longest
+from threading import Thread, Lock
+from typing import Dict, List, Optional, Union, Tuple
+
+import PIL
+import numpy as np
+import random
+import ray
+import torch
+from ray.util.queue import Queue, Empty
+from tensordict import TensorDict
+from transformers import AutoTokenizer, PreTrainedTokenizer, ProcessorMixin
+
+from roll.agentic.env import REGISTERED_ENVS, REGISTERED_ENV_CONFIGS
+from roll.agentic.memory.memory_bank import SocialMemoryBank, mock_embed
+from roll.distributed.scheduler.generate_scheduler import GlobalCounter, RequestScheduler
+from roll.distributed.scheduler.protocol import DataProto
+from roll.pipeline.agentic.agentic_config import EnvManagerConfig, AgenticConfig
+from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.functionals import pad_to_length, normalize_unique_values_by_player
+from roll.utils.logging import get_logger
+
+"""
+base agentic codes reference: https://github.com/RAGEN-AI/RAGEN/blob/main/ragen/llm_agent/es_manager.py
+"""
+
+index_table = {
+    1: "first",
+    2: "second",
+    3: "third",
+    4: "fourth",
+    5: "fifth",
+    6: "sixth",
+    7: "seventh",
+    8: "eighth",
+    9: "ninth",
+    10: "tenth",
+    11: "eleventh",
+    12: "twelfth",
+    13: "thirteenth",
+    14: "fourteenth",
+    15: "fifteenth",
+    16: "sixteenth",
+    17: "seventeenth",
+    18: "eighteenth",
+    19: "nineteenth",
+    20: "twentieth",
+}
+
+
+@dataclass
+class EnvStatus:
+    """Status of an environment"""
+
+    truncated: bool = False  # done but not success
+    terminated: bool = False  # done and success
+    num_actions: int = 0  # current action step (single action)
+    rewards: List[float] = field(default_factory=list)  # rewards for each turn
+    seed: Optional[int] = None  # what seed is used to reset this environment
+    step: int = 0  # current step (single step)
+
+    @property
+    def done(self):
+        return self.truncated or self.terminated
+
+
+def get_masks_and_scores(
+    input_ids: torch.Tensor,
+    tokenizer: AutoTokenizer,
+    all_scores: List[List[float]] = None,
+    use_turn_scores: bool = False,
+):
+    """
+    input_ids: shape (bsz, seq_len)
+    all_scores: list[list[float], 存储每个env每轮的reward
+    Get loss mask that only learns between <|im_start|>assistant and <|im_end|>. Currently only supports qwen.
+    NOTE: important! This assumes that the input_ids starts with system and then user & assistant in alternative ways
+    NOTE: important! input_ids is left pad
+    """
+    # TODO: special tokens add to config
+    assistant_turn_start_tokens = tokenizer.encode("<|im_start|>assistant\n")
+    turn_start_token = assistant_turn_start_tokens[0]
+    turn_starts = torch.where(input_ids == turn_start_token, 1, 0)
+    turn_indicators = torch.cumsum(turn_starts, dim=-1)
+
+    response_mask = (turn_indicators % 2 == 1) & (turn_indicators > 1)  # only learns all assistant turns
+    non_prompt_mask = turn_indicators > 2  # learns everything after system prompt + user prompts
+
+    # turn text: '<|im_start|>assistant\n<answer>Right</answer><|im_end|>'
+    # <|im_start|>assistant\n 应该mask掉才对，保留<|im_end|>
+    for idx, scores in enumerate(zip_longest(*all_scores, fillvalue=0)):
+        """
+        system, user, assistant, user, assistant, user, assistant
+        1,2,3,3,4,5,6
+        assistant位于第3,5,7...
+        """
+        turn_indicator = idx * 2 + 3  # 0: pad. 1: system. 2+2n: user. 3+2n: assistant
+        turn_start_position = (input_ids == turn_start_token) & (turn_indicators == turn_indicator)
+        batch_size, seq_len = input_ids.shape
+        num_tokens = len(assistant_turn_start_tokens)
+        turn_start_indices = turn_start_position.nonzero(as_tuple=True)
+        mask_matrix = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=input_ids.device)
+        for batch_idx, start_idx in zip(turn_start_indices[0], turn_start_indices[1]):
+            end_idx = start_idx + num_tokens
+            if end_idx <= seq_len:
+                mask_matrix[batch_idx, start_idx:end_idx] = True
+        response_mask[mask_matrix] = False
+        if idx == 0:
+            non_prompt_mask[mask_matrix] = False
+
+    # TODO: special tokens add to config
+    reward_token = tokenizer.encode("<|im_end|>")[0]
+    score_tensor = torch.zeros_like(input_ids, dtype=torch.float32)
+    
+    # 新增：记录每个turn结尾位置的变量
+    turn_end_positions = torch.zeros_like(input_ids, dtype=torch.bool)
+    
+    if use_turn_scores:
+        for idx, scores in enumerate(zip_longest(*all_scores, fillvalue=0)):
+            scores = torch.tensor(scores, dtype=torch.float32)
+            turn_indicator = idx * 2 + 3  # 0: pad. 1: system. 2+2n: user. 3+2n: assistant
+            reward_position = (input_ids == reward_token) & (turn_indicators == turn_indicator)
+            # Set the last token of the rows where all positions are False to True
+            reward_position[~reward_position.any(dim=-1), -1] = True
+            # 记录当前turn的结尾位置
+            turn_end_positions = turn_end_positions | reward_position
+            score_tensor[reward_position] = scores
+    else:
+        scores = [sum(i) for i in all_scores]
+        score_tensor[:, -1] = torch.tensor(scores, dtype=torch.float32)
+        # 在非turn_scores模式下，所有turn的结尾位置都在序列末尾
+        turn_end_positions[:, -1] = True
+
+    return non_prompt_mask, score_tensor, response_mask, turn_end_positions
+
+
+class EnvManager:
+    def __init__(
+        self,
+        worker_config: EnvManagerConfig,
+        pipeline_config: AgenticConfig,
+        env_config: Dict,
+        tokenizer: PreTrainedTokenizer,
+        generate_scheduler,
+        input_queue: Queue,
+        output_queue: Queue,
+        thread_lock: Lock,
+        processor: Optional[ProcessorMixin] = None,
+        collator: Optional[callable] = None,
+        mode="train",
+    ):
+        """
+        1. 一个EnvManager持有一个env实例: 执行env.reset, env.step, 管理rollout的状态
+            group trajectory表达: group内的init state一致，依赖env_config 中的seed来控制, 一个group内env 对应episode的seed一致
+            EnvWorker持有多个EnvManager，通过线程的方式实现EnvWorker内部并行
+        2. run_rollout_loop, 持续rollout trajectory, 将done的trajectory回传到output_queue
+        TODO:
+            1. special tokens add to config
+            2. ray max_concurrency 描述多线程是否会更好？
+        """
+        self.logger = get_logger()
+        self.worker_config: EnvManagerConfig = worker_config
+        self.pipeline_config = pipeline_config
+        self.env_config: Dict = env_config
+        self.tokenizer: PreTrainedTokenizer = tokenizer
+        self.processor: ProcessorMixin = processor
+        self.collator = collator
+        self.env_entry = None
+        self.output_queue = output_queue
+        self.input_queue = input_queue
+        self.mode = mode
+        self.generate_scheduler: RequestScheduler = generate_scheduler
+        self.rollout_cache = None
+        self.group_seed = None
+        self.episode_id = 0
+        self.process_input_queue_thread = None
+        self.running = False
+        self.use_thread_lock = self.env_config.get(
+            "use_thread_lock", True
+        )  # 避免同时执行大量cpu操作, 可以通过env_config配置
+        self.thread_lock = thread_lock if self.use_thread_lock else nullcontext()
+        
+        # 新增：保护EnvManager内部状态的锁
+        from threading import Lock
+        self.internal_lock = Lock()
+
+        self.env_entry = copy.deepcopy(self.env_config)
+        self.env_entry["env"] = REGISTERED_ENVS[self.env_entry["env_class"]](self.env_entry["config"])
+        self.env_entry["status"] = EnvStatus()
+
+        self.request_counter = GlobalCounter.options(
+            name=f"EnvManagerRequestCounter",
+            get_if_exists=True,
+            namespace=RAY_NAMESPACE,
+        ).remote()
+        self.request_id: Optional[str] = None
+
+        # Template modification to render thinking state in previous rounds...
+
+        template = '{%- if tools %}\n    {{- \'<|im_start|>system\\n\' }}\n    {%- if messages[0][\'role\'] == \'system\' %}\n        {{- messages[0][\'content\'] }}\n    {%- else %}\n        {{- \'You are a helpful assistant.\' }}\n    {%- endif %}\n    {{- "\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>" }}\n    {%- for tool in tools %}\n        {{- "\\n" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- "\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\"name\\": <function-name>, \\"arguments\\": <args-json-object>}\\n</tool_call><|im_end|>\\n" }}\n{%- else %}\n    {%- if messages[0][\'role\'] == \'system\' %}\n        {{- \'<|im_start|>system\\n\' + messages[0][\'content\'] + \'<|im_end|>\\n\' }}\n    {%- else %}\n        {{- \'<|im_start|>system\\nYou are a helpful assistant.<|im_end|>\\n\' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == "user") or (message.role == "system" and not loop.first) or (message.role == "assistant" and not message.tool_calls) %}\n        {{- \'<|im_start|>\' + message.role + \'\\n\' + message.content + \'<|im_end|>\' + \'\\n\' }}\n    {%- elif message.role == "assistant" %}\n        {{- \'<|im_start|>\' + message.role }}\n        {%- if message.content %}\n            {{- \'\\n\' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- \'\\n<tool_call>\\n{"name": "\' }}\n            {{- tool_call.name }}\n            {{- \'", "arguments": \' }}\n            {{- tool_call.arguments | tojson }}\n            {{- \'}\\n</tool_call>\' }}\n        {%- endfor %}\n        {{- \'<|im_end|>\\n\' }}\n    {%- elif message.role == "tool" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}\n            {{- \'<|im_start|>user\' }}\n        {%- endif %}\n        {{- \'\\n<tool_response>\\n\' }}\n        {{- message.content }}\n        {{- \'\\n</tool_response>\' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}\n            {{- \'<|im_end|>\\n\' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- \'<|im_start|>assistant\\n\' }}\n{%- endif %}\n'
+        if self.tokenizer:
+            self.tokenizer.chat_template = template
+        if self.processor:
+            self.processor.chat_template = template
+
+        self.length_reward_scale = {
+            "upper": 0.0,
+            "lower": 0.5,
+            "min_len": 11,
+            "max_len": 2048,
+            "coef": 1,
+        }
+
+        print(f"Length reward scale: {self.length_reward_scale}")  # For debugging
+
+        self.memory_enabled = getattr(self.pipeline_config, "memory_enabled", False)
+        self.memory_banks = {}
+        if self.memory_enabled:
+            db_path = getattr(self.pipeline_config, "memory_db_path", None)
+            if not db_path:
+                db_path = os.path.join(self.pipeline_config.output_dir, "memory", "social_memory.sqlite3")
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            self.memory_db_path = db_path
+            self.memory_top_k1 = getattr(self.pipeline_config, "memory_top_k1", 50)
+            self.memory_top_k2 = getattr(self.pipeline_config, "memory_top_k2", 5)
+            self.memory_alpha = getattr(self.pipeline_config, "memory_alpha", 0.1)
+            self.memory_embedding_dim = getattr(self.pipeline_config, "memory_embedding_dim", 128)
+            self.memory_intent_turns = getattr(self.pipeline_config, "memory_intent_turns", 3)
+            self.memory_banks[0] = SocialMemoryBank(
+                db_path=db_path,
+                player_id=0,
+                embedding_dim=self.memory_embedding_dim,
+                alpha=self.memory_alpha,
+            )
+            self.memory_banks[1] = SocialMemoryBank(
+                db_path=db_path,
+                player_id=1,
+                embedding_dim=self.memory_embedding_dim,
+                alpha=self.memory_alpha,
+            )
+
+    def reset(self):
+        entry = self.env_entry
+        is_self_play = entry["env"].built_in_opponent == "none"
+        current_player = 0 if is_self_play else 1 - entry["env"].opponent_player
+        
+        # 使用内部锁保护rollout_cache的初始化
+        with self.internal_lock:
+            self.rollout_cache = {
+                "env_id": entry["env_id"],
+                "history": [],
+                "player_0_history": [],
+                "player_1_history": [],
+                "group_id": entry["group_id"],
+                "tag": entry["tag"],
+                "penalty": 0,
+                "frames": [],
+                "is_self_play": is_self_play,
+                "current_player": current_player,
+                "memory_ids": {0: [], 1: []},
+                "last_memory_context": {0: "", 1: ""},
+                "last_memory_ids": {0: [], 1: []},
+            }
+
+        seed = self.group_seed + self.episode_id
+        entry["status"] = EnvStatus(seed=seed)
+
+        with self.thread_lock:
+            initial_observation, execute_results = entry["env"].reset(seed=seed)
+
+        initial_state_entry = {
+            "player": 0,
+            "state": initial_observation['observation'],
+            "legal_actions": initial_observation['legal_actions'],
+        }
+
+        # update rollout cache
+        self.rollout_cache["history"] = self._update_cache_history(
+            self.rollout_cache["history"],
+            num_actions_info=None,
+            next_state_entry=initial_state_entry,
+        )
+        
+        # For self-play, also initialize player 0 history
+        # Note: player 1 history is not initialized here, because the starting state is only for player 0
+        self.rollout_cache["player_0_history"] = self._update_cache_history(
+            self.rollout_cache["player_0_history"],
+            num_actions_info=None,
+            next_state_entry=initial_state_entry,
+        )
+
+        # log first turn by the built-in opponent (if opponent goes first)
+        if execute_results:
+            self._log_env_state(execute_results=execute_results, current_player=0)
+
+        self.episode_id += 1
+        return self.rollout_cache
+
+    def compute_length_penalty(self, token_length: int) -> float:
+        # (tzy) according to orignal design in kimi-1.5, it is better to use a batch of samples to compute min/max length.
+        # however, we don't have a batch of samples. moreover, we just want to penalize the length of the response to avoid overthinking.
+        # reward = 0.5 - (token_length - min_len) / (max_len - min_len)
+
+        # for response in format: `<answer>X({i},{j})</answer><|im_end|>`(0<=i,j<3), the minimum length is 11.
+        min_len = self.length_reward_scale["min_len"]
+        max_len = self.length_reward_scale["max_len"]
+        reward = 0.0
+        # penalize the length of the response
+        reward = self.length_reward_scale["coef"] - (token_length - min_len) / (max_len - min_len)
+
+        if reward > 0:
+            reward *= self.length_reward_scale["upper"]  # scale to make it comparable with the winning rewards
+
+        if reward < 0:
+            reward *= self.length_reward_scale["lower"]  # scale to make it comparable with the winning rewards
+
+        return reward
+
+    def step(self, llm_output: DataProto, current_sequence_length: int):
+        env_input, overlong_response, overlong_sequence = self.get_env_input(llm_output, current_sequence_length)
+        entry = self.env_entry
+
+        # execute actions in env
+        current_player = self.rollout_cache['current_player']
+        valid_actions, lose_for_wrong_format = self._extract_map_valid_actions(
+            entry, 
+            env_input["actions"], 
+            self.rollout_cache["history"][-1]["legal_actions"]
+        )
+        if lose_for_wrong_format or overlong_response or overlong_sequence:
+            execute_results = entry["env"].get_losing_state(current_player, overlong_response, overlong_sequence)
+            format_reward = min(self.worker_config.format_penalty, 0)
+        else:
+            with self.thread_lock:
+                execute_results = entry["env"].step(valid_actions[0])
+            format_reward = max(self.worker_config.format_penalty, 0)
+
+        # log the processed env state
+        self._log_env_state(
+            execute_results=execute_results,
+            format_reward=format_reward,
+            current_player=current_player,
+            env_input=env_input,
+        )
+
+        # 保护玩家切换操作
+        if self.rollout_cache['is_self_play']:
+            with self.internal_lock:
+                self.rollout_cache["current_player"] = entry["env"].current_player
+
+        if self.mode == "val":
+            frame = entry["env"].render(mode="rgb_array")
+            if isinstance(frame, np.ndarray):
+                self.rollout_cache["frames"].append(frame)
+        return entry["status"]
+
+    def generate(self, env_output: Dict):
+        lm_input: DataProto = self.get_lm_input(env_output, prepare_for_update=False)
+
+        current_sequence_length = lm_input.batch["input_ids"].shape[1]
+        token_left = self.pipeline_config.sequence_length - current_sequence_length
+        generation_config = self.worker_config.generating_args.to_dict()
+        generation_config["max_new_tokens"] = max(min(generation_config["max_new_tokens"], token_left), 1)
+        if generation_config["max_new_tokens"] <= 1:
+            self.logger.warning(
+                f"sequence_length = {self.pipeline_config.sequence_length} input_ids length = {lm_input.batch['input_ids'].shape[1]},"
+                f"maybe you should increase the response_length"
+            )
+            return None, current_sequence_length
+
+        gen_batch = lm_input.pop(
+            batch_keys=["input_ids", "attention_mask", "position_ids"],
+            non_tensor_batch_keys=(["multi_modal_data"] if "multi_modal_data" in lm_input.non_tensor_batch else []),
+        )
+        gen_batch.meta_info["generation_config"] = generation_config
+        gen_batch.meta_info["response_callback_fn"] = self.generate_scheduler.report_response.remote
+        self.request_id = str(ray.get(self.request_counter.get_value.remote()))
+        gen_batch.meta_info["request_id"] = self.request_id
+        gen_batch.meta_info["src_rank"] = self.env_config["env_id"]
+        lm_output: DataProto = ray.get(self.generate_scheduler.generate_one_request.remote(data=gen_batch))
+
+        if lm_output is not None:
+            # 未被abort
+            gen_batch.meta_info.pop("generation_config")
+            lm_input = lm_input.repeat(repeat_times=generation_config["num_return_sequences"])
+            lm_output.union(lm_input)
+        return lm_output, current_sequence_length
+
+    def run_rollout_loop(self, data: DataProto):
+        """
+        1. 每次调用run_rollout_loop,
+            会持续的play episode, 直到收到采集完成的command
+            需要重置seed, 确保每个group的seed一致
+            episode_id 置0
+        seed更新逻辑:
+            group_seed = seed + group_seed
+            episode_seed = group_seed + episode_id
+
+        trajectory_id: f"{group_id}_{episode_id}_{episode_seed}"
+        """
+
+        self.start_input_queue_process()
+        self.running = True
+        self.num_states = [0, 0]  # Track state transitions for each player
+        self.episode_id = 0
+
+        self.group_seed = data.meta_info["seed"] + self.env_entry["group_seed"]
+        env_output = self.reset()
+
+        while self.running:
+            lm_output, current_sequence_length = self.generate(env_output)
+
+            status = EnvStatus(truncated=True, terminated=True)
+            if lm_output is not None:
+                status: EnvStatus = self.step(lm_output, current_sequence_length)
+
+            if status.done and self.running:
+                rollouts = self.formulate_rollouts()
+                for rollout in rollouts:
+                    traj_group_id = f"{self.env_entry['group_id']}_{self.episode_id}_{self.group_seed}"
+                    # For self-play, append player info to trajectory group ID
+                    if len(rollouts) > 1:  # Self-play mode
+                        player_id = rollout.non_tensor_batch.get("group_ids", [""])[0].split("_p")[-1]
+                        if player_id.isdigit():
+                            traj_group_id = f"{traj_group_id}_p{player_id}"
+                    
+                    rollout.non_tensor_batch["traj_group_id"] = np.array([traj_group_id], dtype=object)
+                    self.output_queue.put_nowait(rollout)
+                
+                self.rollout_cache = None
+                if self.episode_id >= self.worker_config.max_traj_per_env:
+                    self.logger.debug(
+                        f"env_id: {self.env_config['env_id']} max_traj_per_env {self.worker_config.max_traj_per_env} reached, stopping rollout loop"
+                    )
+                    break
+                env_output = self.reset()
+
+        self.process_input_queue_thread.join()
+
+    def get_lm_input(self, env_output, prepare_for_update: bool) -> DataProto:
+        player_id = env_output["current_player"]
+        llm_input_texts, messages_list = self._format_messages(
+            prepare_for_update=prepare_for_update,
+            use_raw_llm_response=False,
+            player_id=player_id,
+        )
+        # print(f"player_id: {env_output['current_player']}, lm_input_texts: {llm_input_texts}")
+        inputs = self.tokenizer(
+            llm_input_texts, return_tensors="pt", padding=True, padding_side="left", truncation=False
+        )  # do not truncate here. Process later at TODO
+        input_ids, attention_mask = inputs.input_ids, inputs.attention_mask
+        position_ids = attention_mask.cumsum(dim=-1)
+        llm_inputs = DataProto()
+        llm_inputs.batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=input_ids.shape[0],
+        )
+        llm_inputs.non_tensor_batch.update(
+            {
+                "env_ids": np.array([env_output["env_id"]], dtype=object),
+                "group_ids": np.array([env_output["group_id"]], dtype=object),
+                "llm_input_texts": np.array(llm_input_texts, dtype=object),
+                "messages_list": np.array(messages_list, dtype=object),
+                "tags": np.array([env_output["tag"]], dtype=object),
+            }
+        )
+        if self.memory_enabled:
+            memory_ids = self.rollout_cache["last_memory_ids"].get(player_id, [])
+            llm_inputs.non_tensor_batch["memory_ids"] = np.array([memory_ids], dtype=object)
+        return llm_inputs
+
+    def get_env_input(self, lm_output: DataProto, current_sequence_length: int) -> Dict:
+        if lm_output.batch is not None and "responses" in lm_output.batch.keys():
+            responses = self.tokenizer.batch_decode(lm_output.batch["responses"], skip_special_tokens=True)
+            token_lengths = list(map(len, lm_output.batch["responses"]))
+        else:  # dataproto has textual responses
+            responses = lm_output.non_tensor_batch["response_texts"]
+            token_lengths = list(map(lambda x: len(self.tokenizer.encode(x)) + 1, responses))  # + 1 for eos token
+
+        responses = [
+            "<think>\n" + response if self.pipeline_config.enable_think else "<answer>" + response
+            for response in responses
+        ]  # The LLM generation does not include <think> tags. Add them back here.
+
+        env_ids = lm_output.non_tensor_batch["env_ids"]
+        env_id = env_ids[0]
+        response = responses[0]
+        token_length = token_lengths[0]
+        llm_response, actions = self._parse_response(response)
+        env_input = {
+            "env_id": env_id,
+            "llm_raw_response": response,
+            "llm_response": llm_response,
+            "actions": actions,
+            # (tzy) use the token length information to compute length penalty reward.
+            "current_sequence_length": current_sequence_length,
+            "token_length": token_length,
+            "token_left": self.pipeline_config.sequence_length - current_sequence_length - token_length,
+        }
+        overlong_response = True if token_length >= 4096 else False
+        overlong_sequence = True if env_input["token_left"] <= 1000 else False
+        return env_input, overlong_response, overlong_sequence
+
+    def formulate_rollouts(self):
+        """
+        1. 每个env的trajectory 应该是一个rollout
+        2. 每个rollout 应该是一个List[Dict]
+        3. 每个Dict 应该是一个step的信息
+        4. For self-play mode, generate separate trajectories for both players
+        
+        Returns:
+            For single-agent mode: Single DataProto object (for backward compatibility)
+            For self-play mode: List of DataProto objects (one for each player)
+        """
+        # print("env_status: ", self.env_entry["status"])
+        # print("rollout cache: ", self.rollout_cache)
+        
+        # 保护rollout_cache的读取
+        with self.internal_lock:
+            if self.rollout_cache["is_self_play"]:
+                # Self-play mode
+                rollouts = []
+                for player_id in [0, 1]:
+                    history_key = f"player_{player_id}_history"
+                    if len(self.rollout_cache[history_key]) > 0:
+                        rollouts.append(self._formulate_single_rollout(player_id=player_id))
+                        self.num_states[player_id] += len(self.rollout_cache[history_key])
+                return rollouts
+            else:
+                # Single agent mode - return single rollout
+                return [self._formulate_single_rollout(player_id=self.rollout_cache["current_player"])]
+
+    def _formulate_single_rollout(self, player_id=0):
+        """Generate a single rollout trajectory, optionally for a specific player in self-play mode"""
+        is_self_play = self.rollout_cache["is_self_play"]
+        history_key = f"player_{player_id}_history"
+            
+        llm_input_texts, messages_list = self._format_messages(
+            prepare_for_update=True, 
+            use_raw_llm_response=False, 
+            player_id=player_id,
+        )
+        # # DEBUG
+        # print(f"=====================DEBUG Begin=====================\n")
+        # print("llm_input_texts: ", llm_input_texts)
+        # # print("messages_list: ", messages_list)
+        # print(f"is_self_play: {is_self_play}, player_id: {player_id}, messages_list: {messages_list}")
+        # print("env_status: ", self.env_entry["status"])
+        # print(f"State:{self.env_entry['env'].render()}")
+        # print(f"Info: {self.env_entry['env']._get_info()}\n")
+        # print(f"=====================DEBUG End=====================\n")
+
+        inputs = self.tokenizer(
+            llm_input_texts, return_tensors="pt", padding=True, padding_side="left", truncation=False
+        )
+        input_ids, attention_mask = inputs.input_ids, inputs.attention_mask
+        position_ids = attention_mask.cumsum(dim=-1)
+        llm_inputs = DataProto()
+        llm_inputs.batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=input_ids.shape[0],
+        )
+        try:
+            scores = [[i["reward"] for i in self.rollout_cache[history_key]]]
+        except:
+            print("rollout_cache: ", self.rollout_cache)
+            print("history_key: ", history_key)
+            raise ValueError("reward not found in rollout_cache")
+        # print("scores: ", scores)
+        episode_scores = [sum(i) for i in scores]
+        penalty = self.rollout_cache["penalty"]
+
+        non_prompt_mask, score_tensor, response_mask, turn_end_positions = get_masks_and_scores(
+            input_ids, self.tokenizer, scores, use_turn_scores=self.pipeline_config.use_turn_scores
+        )
+        non_prompt_mask = torch.logical_and(non_prompt_mask, attention_mask)
+        response_mask = torch.logical_and(response_mask, attention_mask)
+        response_length = response_mask.sum(dim=-1).float().mean().item()
+        response_length_per_turn = [i["token_length"] for i in self.rollout_cache[history_key]]
+
+        input_ids = pad_to_length(
+            input_ids, length=self.pipeline_config.sequence_length, pad_value=self.tokenizer.pad_token_id
+        )
+        attention_mask = pad_to_length(attention_mask, length=self.pipeline_config.sequence_length, pad_value=0)
+        position_ids = pad_to_length(position_ids, length=self.pipeline_config.sequence_length, pad_value=0)
+        response_mask = pad_to_length(response_mask, length=self.pipeline_config.sequence_length, pad_value=0)
+        non_prompt_mask = pad_to_length(non_prompt_mask, length=self.pipeline_config.sequence_length, pad_value=0)
+        score_tensor = pad_to_length(score_tensor, length=self.pipeline_config.sequence_length, pad_value=0)
+        turn_end_positions = pad_to_length(turn_end_positions, length=self.pipeline_config.sequence_length, pad_value=0)
+
+        llm_inputs.batch.update(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "penalty": torch.Tensor([penalty]),
+            }
+        )
+        
+        # Create trajectory group ID that includes player info for self-play
+        env_id = self.rollout_cache["env_id"]
+        group_id = self.rollout_cache["group_id"]
+        if is_self_play and player_id is not None:
+            # Add player suffix to differentiate trajectories
+            env_id = f"{env_id}_p{player_id}"
+            group_id = f"{group_id}_p{player_id}"
+        
+        llm_inputs.non_tensor_batch.update(
+            {
+                "env_ids": np.array([env_id], dtype=object),
+                "group_ids": np.array([group_id], dtype=object),
+                "messages_list": np.array(messages_list, dtype=object),
+                "tags": np.array([self.rollout_cache["tag"]], dtype=object),
+                "frames": np.array([self.rollout_cache["frames"]], dtype=object),
+            }
+        )
+        if self.memory_enabled:
+            memory_ids = self.rollout_cache["memory_ids"].get(player_id, [])
+            llm_inputs.non_tensor_batch["memory_ids"] = np.array([memory_ids], dtype=object)
+        # pad to response length
+        llm_inputs.batch["llm_response_mask"] = response_mask
+        llm_inputs.batch["non_prompt_mask"] = non_prompt_mask
+        llm_inputs.batch["response_mask"] = non_prompt_mask
+        if self.pipeline_config.enable_response_mask:
+            # 只使用llm的response mask，不包含环境的state
+            llm_inputs.batch["response_mask"] = response_mask
+        first_true_indices = non_prompt_mask.int().argmax(dim=1)
+        no_true_mask = ~non_prompt_mask.any(dim=1)
+        first_true_indices[no_true_mask] = non_prompt_mask.size(1)
+        batch_size, seq_len = non_prompt_mask.size()
+        arange = torch.arange(seq_len, device=non_prompt_mask.device).unsqueeze(0).expand(batch_size, -1)
+        prompt_mask = arange < first_true_indices.unsqueeze(1)
+        llm_inputs.batch["prompt_mask"] = prompt_mask
+        llm_inputs.batch["scores"] = score_tensor
+        llm_inputs.batch["turn_end_positions"] = turn_end_positions
+        # for llm raw response
+        llm_raw_text_list, _ = self._format_messages(
+            prepare_for_update=True, 
+            use_raw_llm_response=True,
+            player_id=player_id,
+        )
+        # print("llm_raw_text_list: ", llm_raw_text_list)
+        llm_inputs.non_tensor_batch["turn_scores"] = np.array(scores, dtype=object)
+        llm_inputs.non_tensor_batch["episode_scores"] = np.array(episode_scores, dtype=object)
+        llm_inputs.non_tensor_batch["llm_raw_text_list"] = np.array(llm_raw_text_list, dtype=object)
+
+        entry = self.env_entry
+        status = entry["status"]
+        env_metric = {
+            "success": float(status.terminated and (not status.truncated)),
+            "num_actions": status.num_actions,
+        }
+        
+        # Calculate metrics
+        custom_metric = {}
+        for turn in self.rollout_cache[history_key]:
+            for k, v in turn.get("info", {}).items():
+                if k == "success":
+                    env_metric[k] = float(v)
+                    continue
+                if isinstance(v, str):
+                    continue
+                if k not in custom_metric:
+                    custom_metric[k] = []
+                custom_metric[k].append(float(v))
+
+        for k, v in custom_metric.items():
+            # env_metric[k] = np.sum(v) / len(player_rollout_cache['history'])
+            env_metric[k] = np.sum(v)
+
+        if len(self.rollout_cache[history_key]) > 0:
+            self.rollout_cache[history_key][-1]["metrics"] = custom_metric
+
+        env_metric = {f"env/{entry['tag']}/{k}": v for k, v in env_metric.items()}
+        env_metric[f"env/{entry['tag']}/response_length"] = response_length
+        
+        # Add per-turn response length metrics
+        env_metric[f"env/{entry['tag']}/response_length_per_turn"] = np.mean(response_length_per_turn)
+        for turn_idx, turn_length in enumerate(response_length_per_turn):
+            env_metric[f"env/{entry['tag']}/response_length_turn_{turn_idx}"] = turn_length
+        # Add player-specific response length metrics for self-play mode
+        if is_self_play:
+            env_metric[f"env/{entry['tag']}/response_length_player_{player_id}"] = response_length
+            # Also add per-turn metrics for each player
+            env_metric[f"env/{entry['tag']}/response_length_per_turn_player_{player_id}"] = np.mean(response_length_per_turn)
+            for turn_idx, turn_length in enumerate(response_length_per_turn):
+                env_metric[f"env/{entry['tag']}/response_length_player_{player_id}_turn_{turn_idx}"] = turn_length
+        self.rollout_cache["metrics"] = env_metric
+        llm_inputs.meta_info = {"metrics": env_metric}
+
+        if self.memory_enabled and self.mode == "train":
+            social_feedback = self._compute_social_feedback(player_id=player_id, is_self_play=is_self_play)
+            intent_text = self._build_intent_text(player_id=player_id, max_turns=self.memory_intent_turns)
+            intent_emb = mock_embed(intent_text, dim=self.memory_embedding_dim)
+            experience_text = self._serialize_experience_text(player_id=player_id)
+            bank = self.memory_banks.get(player_id)
+            if bank is not None:
+                new_memory_id = bank.add_experience(
+                    intent_emb=intent_emb,
+                    experience_text=experience_text,
+                    initial_q=social_feedback,
+                )
+                used_ids = self._flatten_memory_ids(self.rollout_cache["memory_ids"].get(player_id, []))
+                bank.update_q_values(retrieved_ids=used_ids, reward=social_feedback)
+
+                llm_inputs.non_tensor_batch["memory_new_id"] = np.array([new_memory_id], dtype=object)
+                llm_inputs.non_tensor_batch["memory_updated_ids"] = np.array([used_ids], dtype=object)
+                llm_inputs.non_tensor_batch["memory_social_feedback"] = np.array([social_feedback], dtype=object)
+        return llm_inputs
+    
+    def _update_player_history(self, player_id: int = None, num_actions_info=None, next_state_entry=None):
+        """Update history for a specific player, with thread safety"""
+        if player_id is None:
+            # Special case: update main history in self-play mode
+            history_key = "history"
+        else:
+            history_key = f"player_{player_id}_history"
+        
+        self._update_cache_history(
+            self.rollout_cache[history_key],
+            num_actions_info=num_actions_info,
+            next_state_entry=next_state_entry,
+        )
+
+    def _update_cache_history(
+        self, history: List[Dict], num_actions_info: Optional[Dict] = None, next_state_entry: Optional[Dict] = None
+    ):
+        """
+        Update last step info and append state to history
+        """
+        if num_actions_info is not None:  # update last step info
+            assert len(history), "History should not be empty"
+            num_actions_info = num_actions_info.copy()
+            for k, v in num_actions_info.items():
+                if k == "reward" and k in history[-1]:
+                    history[-1][k] += v
+                else:
+                    history[-1][k] = v
+        if next_state_entry is not None:
+            next_state_entry = next_state_entry.copy()
+            history.append(next_state_entry)
+        return history
+
+    def _extract_map_valid_actions(self, entry: Dict, actions: List[str], legal_actions: Dict[int,str]):
+        """extract valid actions from the action lookup table (if exists)"""
+        mapped_actions = []
+        action_lookup = getattr(entry["env"].config, "action_lookup", None)
+        if action_lookup is None:
+            mapped_actions = actions
+        else:  # the envs have pre-defined action lookup
+            rev_action_lookup = {v.lower(): k for k, v in action_lookup.items()}
+            actions = [action.lower() for action in actions]
+            mapped_actions = [rev_action_lookup[action] for action in actions if action in rev_action_lookup]
+
+        mapped_actions = [action for action in mapped_actions if action in legal_actions.values()]
+        illegal_actions = [action for action in actions if action not in legal_actions.values()]
+        lose_for_wrong_format = False
+        if len(mapped_actions) != 1 or len(illegal_actions) > 0:
+            lose_for_wrong_format = True
+            # print(f"Invalid actions: {actions}, mapped actions: {mapped_actions}, legal actions: {legal_actions}")
+        return mapped_actions, lose_for_wrong_format
+
+    def _log_env_state(self, execute_results: Tuple[Dict], current_player: int, format_reward: float=0, env_input: Dict=None):
+        assert execute_results[0]['current_player'] == current_player, f"current_player: {current_player}, execute_results: {execute_results}"
+        for idx, turn in enumerate(execute_results):
+            current_player = turn['current_player']
+            # Update status
+            self.env_entry["status"].step += 1
+            self.env_entry["status"].num_actions += 1
+            self.env_entry["status"].rewards.append(turn['rewards'])
+            if turn['done']:
+                self.env_entry["status"].terminated = True
+                self.env_entry["status"].truncated = not turn['info'].get("success", False)
+            if self.env_entry["status"].step >= self.env_entry["max_actions_per_traj"] and not turn['done']:
+                self.env_entry["status"].truncated = True
+                self.env_entry["status"].terminated = True
+            
+            actions_left = self.env_entry["max_actions_per_traj"] - self.env_entry["status"].num_actions
+            num_actions_info = {
+                "actions": turn['action'],
+                "reward": turn['rewards'][current_player],
+                "info": turn['info'],
+                "actions_left": actions_left,
+            }
+            next_state_entry = {
+                "player": turn['next_player'],
+                "state": turn['observation'],
+                "legal_actions": turn['legal_actions'],
+            }
+            if idx == 0 and env_input is not None:
+                length_penalty = self.compute_length_penalty(env_input["token_length"])
+                num_actions_info['reward'] += format_reward + length_penalty
+                num_actions_info.update({
+                    'llm_response': env_input["llm_response"], 
+                    'llm_raw_response': env_input["llm_raw_response"], 
+                    'current_sequence_length': env_input["current_sequence_length"], 
+                    'token_length': env_input["token_length"], 
+                    'token_left': env_input["token_left"], 
+                })
+        
+            # 保护历史记录更新操作
+            with self.internal_lock:
+                # Update main history and player-specific histories
+                self._update_player_history(None, num_actions_info, next_state_entry)  # main history only gets state
+                self._update_player_history(current_player, num_actions_info, None)  # current player gets action/reward
+                
+                # Update opponent's history with reward and info
+                opponent_player = 1 - current_player
+                if len(self.rollout_cache[f"player_{opponent_player}_history"]) > 0:
+                    self._update_player_history(opponent_player, {
+                        "reward": turn['rewards'][opponent_player],
+                        "info": turn['info'],
+                    }, None)
+                
+                # If episode continues, give next player the next state
+                if not self.env_entry["status"].terminated and not self.env_entry["status"].truncated:
+                    self._update_player_history(turn['next_player'], None, next_state_entry)
+
+    def _build_intent_text(self, player_id: int, max_turns: int) -> str:
+        history_key = f"player_{player_id}_history"
+        history = self.rollout_cache.get(history_key, [])
+        if not history:
+            history = self.rollout_cache.get("history", [])
+        recent = history[-max_turns:]
+        parts = []
+        for item in recent:
+            if "state" in item:
+                parts.append(f"STATE: {item['state']}")
+            if "actions" in item:
+                parts.append(f"ACTION: {item['actions']}")
+            if "reward" in item:
+                parts.append(f"REWARD: {item['reward']}")
+
+        teammate_key = f"player_{1 - player_id}_history"
+        teammate_hist = self.rollout_cache.get(teammate_key, [])
+        if teammate_hist:
+            teammate_last = teammate_hist[-1]
+            if "actions" in teammate_last:
+                parts.append(f"TEAMMATE_ACTION: {teammate_last['actions']}")
+
+        return "\n".join(parts)
+
+    def _retrieve_memory_context(self, player_id: int) -> Tuple[str, List[int]]:
+        if not self.memory_enabled:
+            return "", []
+        bank = self.memory_banks.get(player_id)
+        if bank is None:
+            return "", []
+
+        intent_text = self._build_intent_text(player_id=player_id, max_turns=self.memory_intent_turns)
+        intent_emb = mock_embed(intent_text, dim=self.memory_embedding_dim)
+        results = bank.retrieve_context(
+            current_intent_emb=intent_emb,
+            top_k1=self.memory_top_k1,
+            top_k2=self.memory_top_k2,
+        )
+        if not results:
+            return "", []
+
+        success = [item for item in results if item["q_value"] >= 0]
+        failed = [item for item in results if item["q_value"] < 0]
+        parts = []
+        if success:
+            parts.append("[Social Context: Successful Experiences]")
+            for item in success:
+                parts.append(f"- {item['experience']} (Q={item['q_value']:.3f})")
+        if failed:
+            parts.append("[Social Context: Failed Experiences]")
+            for item in failed:
+                parts.append(f"- {item['experience']} (Q={item['q_value']:.3f})")
+        return "\n".join(parts), [item["id"] for item in results]
+
+    def _format_messages(self, prepare_for_update: bool, use_raw_llm_response: bool, player_id: int = 0):
+        history_key = "history"
+
+        if "reward" not in self.rollout_cache[history_key][-1] and (not use_raw_llm_response and prepare_for_update):
+            # when prepare for update, we do not add the state from the n+1 turn to the trajectory
+            # print(f"removing last state from history: {env_output['history'][-1]}")
+            self.rollout_cache[history_key] = self.rollout_cache[history_key][:-1]
+
+        prefix_prompt = self.env_entry["env"].get_prompt(
+            mode="prefix", 
+            think=self.pipeline_config.enable_think,
+            player_id=player_id,
+        )
+
+        memory_context = ""
+        if self.memory_enabled and not use_raw_llm_response:
+            if not prepare_for_update:
+                memory_context, memory_ids = self._retrieve_memory_context(player_id)
+                with self.internal_lock:
+                    self.rollout_cache["last_memory_context"][player_id] = memory_context
+                    self.rollout_cache["last_memory_ids"][player_id] = memory_ids
+                    self.rollout_cache["memory_ids"][player_id].append(memory_ids)
+            else:
+                with self.internal_lock:
+                    memory_context = self.rollout_cache["last_memory_context"].get(player_id, "")
+
+        if memory_context:
+            prefix_prompt["system"] = f"{prefix_prompt['system']}\n\n{memory_context}"
+        messages = [
+            {"role": "system", "content": prefix_prompt["system"]},
+            {"role": "user", "content": prefix_prompt["user"]},
+        ]
+
+        for idx, content in enumerate(self.rollout_cache[history_key]):
+            if messages[-1]["role"] != "user":
+                # ensure the last message is user message.
+                messages.append({"role": "user", "content": ""})
+
+            # Original logic for single-agent mode against built-in opponent
+            turn_idx = idx + 1
+            is_opponent_turn = content["player"] != player_id
+            if is_opponent_turn:
+                if self.env_entry["env"].include_opponent_turn == "full":
+                    turn_idx_content = (
+                        f"Information of Turn-{turn_idx}:\n\n"
+                        "This is the other player's turn. "
+                        "The game state, legal actions, as well as the chosen action of the other player for this turn are provided below.\n\n"
+                    )
+                elif self.env_entry["env"].include_opponent_turn == "action_full":
+                    turn_idx_content = (
+                        f"Information of Turn-{turn_idx}:\n\n"
+                        "This is the other player's turn. The game state for this turn is not available to you. "
+                        "The legal actions and chosen action of the other player for this turn are provided below.\n\n"
+                    )
+                elif self.env_entry["env"].include_opponent_turn == "action":
+                    turn_idx_content = (
+                        f"Information of Turn-{turn_idx}:\n\n"
+                        "This is the other player's turn. The game state for this turn is not available to you. "
+                        "The chosen action of the other player for this turn is provided below.\n\n"
+                    )
+                elif self.env_entry["env"].include_opponent_turn == "none":
+                    continue
+            else:
+                turn_idx_content = (
+                    f"Information of Turn-{turn_idx}:\n\n"
+                    "This is your turn. The game state and legal actions for this turn are provided below. "
+                    "Please choose your action and strictly follow the given output format in the response instructions.\n\n"
+                )
+            messages[-1]["content"] += turn_idx_content
+            if "state" in content:
+                if is_opponent_turn:
+                    if self.env_entry["env"].include_opponent_turn == "full":
+                        messages[-1]["content"] += (
+                            f"GAME STATE:\n{content['state']}\n\n"
+                            f"LEGAL ACTIONS:\n{', '.join(content['legal_actions'].values())}.\n\n"
+                        )
+                    elif self.env_entry["env"].include_opponent_turn == "action_full":
+                        messages[-1]["content"] += (
+                            f"LEGAL ACTIONS:\n{', '.join(content['legal_actions'].values())}.\n\n"
+                        )
+                    if len(content['actions']) > 0:
+                        messages[-1]["content"] += f"CHOSEN ACTION:\n{content['actions']}\n"
+                else:
+                    messages[-1]["content"] += (
+                        f"GAME STATE:\n{content['state']}\n\n"
+                        f"LEGAL ACTIONS:\n{', '.join(content['legal_actions'].values())}.\n\n"
+                    )
+            if "llm_raw_response" in content and not is_opponent_turn:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        # "content": content["llm_response"] if not use_raw_llm_response else content["llm_raw_response"],
+                        "content": content["llm_raw_response"],
+                    }
+                )
+
+        # NOTE: this assertion is important for loss mask computation
+        assert all(msg["role"] == "assistant" for msg in messages[2::2])
+
+        if self.processor:
+            # processor.chat_template might be different with tokenizer
+            # can also set tokenizer.chat_template to processor.chat_template
+            text = self.processor.apply_chat_template(
+                messages, add_generation_prompt=(not prepare_for_update), tokenize=False
+            )
+        else:
+            text = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=(not prepare_for_update), tokenize=False
+            )
+        if use_raw_llm_response:
+            prompt_messages = messages[:2]
+            if self.processor:
+                prompt_text = self.processor.apply_chat_template(
+                    prompt_messages, add_generation_prompt=False, tokenize=False
+                )
+            else:
+                prompt_text = self.tokenizer.apply_chat_template(
+                    prompt_messages, add_generation_prompt=False, tokenize=False
+                )
+            text = text[len(prompt_text) :]
+        if not prepare_for_update:
+            if self.pipeline_config.enable_think:
+                text += "<think>\n"  # force the LLM to think before answering
+            else:
+                text += "<answer>"  # force the LLM to answer
+
+        # TODO: 应该没有必要，注意处理mask
+        # TODO: special tokens add to config
+        text = text.replace("<|im_end|>\n", "<|im_end|>")
+        return [text], [messages]
+
+    def _parse_response(self, response: str) -> List:
+        pattern = (
+            r"^<think>(.*?)</think>\s*<answer>(.*?)</answer>$"
+            if self.pipeline_config.enable_think
+            else r"^<answer>(.*?)</answer>$"
+        )
+        match = re.search(pattern, response, re.DOTALL)
+        if not match:
+            think_content, action_content, actions = "INVALID", "INVALID", []  # 如何更好的处理invalid response?
+            # print(f"Invalid response format: {response}")
+            # yali: this may be cause potential crash
+            # llm_response, actions = response, []
+        else:
+            if self.pipeline_config.enable_think:
+                think_content, action_content = match.group(1), match.group(2)
+            else:
+                think_content, action_content = "", match.group(1)
+
+            for special_token in self.pipeline_config.special_token_list:
+                action_content = action_content.replace(special_token, "").strip()
+                think_content = think_content.replace(special_token, "").strip()
+
+            actions = [
+                action.strip() for action in action_content.split(self.pipeline_config.action_sep) if action.strip()
+            ]
+            max_actions = 1
+
+            if len(actions) > max_actions:
+                actions = actions[:max_actions]  # Only the first MAX_ACTIONS actions are kept in the rollout.
+                action_content = (" " + self.pipeline_config.action_sep + " ").join(actions)
+
+        llm_response = (
+            f"<think>\n{think_content}\n</think><answer>{action_content}</answer>"
+            if self.pipeline_config.enable_think
+            else f"<answer>{action_content}</answer>"
+        )
+        return llm_response, actions
+
+    def start_input_queue_process(self):
+        def process_input_queue(input_queue):
+            while True:
+                try:
+                    command = input_queue.get_nowait()
+                except Empty:
+                    time.sleep(1)
+                    continue
+                if command == "stop":
+                    self.logger.debug(f"{self.env_config['env_id']} stopped, episode_id: {self.episode_id}")
+                    self.running = False
+                    ray.get(
+                        self.generate_scheduler.abort_request.remote(
+                            DataProto(meta_info={"request_id": self.request_id})
+                        )
+                    )
+                    self.request_id = None
+                    break
+
+        self.process_input_queue_thread = Thread(target=process_input_queue, args=(self.input_queue,))
+        self.process_input_queue_thread.start()
